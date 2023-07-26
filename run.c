@@ -17,6 +17,11 @@ $ ./run
 #include <fcntl.h>
 #include <sys/mman.h>
 
+enum {
+   MODE_TIME = 0,
+   MODE_SAVE
+};
+
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -50,8 +55,6 @@ typedef struct {
     // freq_cis for RoPE relatively positional embeddings
     float* freq_cis_real; // (seq_len, dim/2)
     float* freq_cis_imag; // (seq_len, dim/2)
-    // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
 } TransformerWeights;
 
 typedef struct {
@@ -112,7 +115,7 @@ void free_run_state(RunState* s) {
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
 
-void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int shared_weights) {
+void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f) {
     float* ptr = f;
     w->token_embedding_table = ptr;
     ptr += p->vocab_size * p->dim;
@@ -140,8 +143,6 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
     int head_size = p->dim / p->n_heads;
     ptr += p->seq_len * head_size / 2;
     w->freq_cis_imag = ptr;
-    ptr += p->seq_len * head_size / 2;
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
 // ----------------------------------------------------------------------------
@@ -277,16 +278,14 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
             // softmax the scores to get attention weights, from 0..pos inclusively
             softmax(att, pos + 1);
-
+            
             // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                float* v = s->value_cache + loff + t * dim + h * head_size;
-                float a = att[t];
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
+            for (int i = 0; i < head_size; i++) {
+                float val = 0.0f;
+                for (int t = 0; t <= pos; t++) {
+                    val += att[t] * s->value_cache[loff + t * dim + h * head_size + i]; // note bad locality
                 }
+                s->xb[h * head_size + i] = val;
             }
         }
 
@@ -325,7 +324,44 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, w->token_embedding_table, p->dim, p->vocab_size);
+}
+
+int transformer_str(char *input, int pos, int steps, Config* p, RunState* s, TransformerWeights* w, char **vocab) {
+    while (input[0] != 0) {
+        if (pos >= steps) return pos;
+
+        int next = -1;
+        int next_length = 0;
+        for (int i = 0; i < p->vocab_size; i++) {
+            char *v = vocab[i];
+            int j = 0;
+            int hit = 1;
+            while (v[j] != 0) {
+                 if (0 == input[j] || v[j] != input[j]) {
+                    hit = 0;
+                    break;
+                }
+                ++j;
+            }
+            if (hit && j > next_length) {
+                next_length = j;
+                next = i;
+            }
+        }
+
+        if (0 > next) return pos;
+
+        pos++;
+        transformer(next, pos, p, s, w);
+
+        printf("%s", vocab[next]);
+        fflush(stdout);
+
+        input += next_length;
+    }
+
+    return pos;
 }
 
 int sample(float* probabilities, int n) {
@@ -357,14 +393,9 @@ int argmax(float* v, int n) {
 // ----------------------------------------------------------------------------
 
 long time_in_ms() {
-    struct timespec time;
-    // Get the current time with nanosecond precision
-    if (clock_gettime(CLOCK_REALTIME, &time) == 0) {
-        return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-    } else {
-        perror("clock_gettime");
-        return -1; // Return -1 to indicate an error
-    }
+  struct timespec time;
+  timespec_get(&time, TIME_UTC);
+  return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 int main(int argc, char *argv[]) {
@@ -389,6 +420,26 @@ int main(int argc, char *argv[]) {
         steps = atoi(argv[3]);
     }
 
+    char *prompt = NULL;
+    if (argc >= 5) {
+        prompt = argv[4];
+    }
+
+    char *antiprompt_cur = NULL;
+    char *antiprompt = NULL;
+    if (argc >= 6) {
+        antiprompt = argv[5];
+        antiprompt_cur = antiprompt;
+    }
+
+    int mode = MODE_TIME;
+    if (argc >= 7) {
+        char *mode_str = argv[6];
+        if (0 == strcmp("save",mode_str)) {
+            mode = MODE_SAVE;
+        }
+    }
+
     // seed rng with time. if you want deterministic behavior use temperature 0.0
     srand((unsigned int)time(NULL)); 
     
@@ -406,9 +457,6 @@ int main(int argc, char *argv[]) {
         }
         // read in the config header
         if(fread(&config, sizeof(Config), 1, file) != 1) { return 1; }
-        // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-        int shared_weights = config.vocab_size > 0 ? 1 : 0;
-        config.vocab_size = abs(config.vocab_size);
         // figure out the file size
         fseek(file, 0, SEEK_END); // move file pointer to end of file
         file_size = ftell(file); // get the file size, in bytes
@@ -418,8 +466,7 @@ int main(int argc, char *argv[]) {
         if (fd == -1) { printf("open failed!\n"); return 1; }
         data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) { printf("mmap failed!\n"); return 1; }
-        float* weights_ptr = data + sizeof(Config)/sizeof(float);
-        checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
+        checkpoint_init_weights(&weights, &config, data + sizeof(Config)/sizeof(float));
     }
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len) { steps = config.seq_len; }
@@ -452,12 +499,18 @@ int main(int argc, char *argv[]) {
     int next;
     int token = 1; // 1 = BOS token in Llama-2 sentencepiece
     int pos = 0;
-    printf("<s>\n"); // explicit print the initial BOS token (=1), stylistically symmetric
+    if (mode != MODE_SAVE) {
+        printf("<s>\n"); // explicit print the initial BOS token (=1), stylistically symmetric
+    }
+
+    transformer(token, pos, &config, &state, &weights);
+
+    if (prompt)
+    {
+        pos = transformer_str(prompt, pos, steps, &config, &state, &weights, vocab);
+    }
+
     while (pos < steps) {
-
-        // forward the transformer to get logits for the next token
-        transformer(token, pos, &config, &state, &weights);
-
         // sample the next token
         if(temperature == 0.0f) {
             // greedy argmax sampling
@@ -476,11 +529,35 @@ int main(int argc, char *argv[]) {
         // advance forward
         token = next;
         pos++;
+
+        // forward the transformer to get logits for the next token
+        transformer(token, pos, &config, &state, &weights);
+
+        // check antiprompt
+        if (antiprompt) {
+            char *vocab_cur = vocab[next];
+            while (0 != *vocab_cur) {
+                if (0 == *antiprompt_cur) {
+                    antiprompt_cur = antiprompt;
+                    steps = pos;
+                    break;
+                }
+                if (*antiprompt_cur == *vocab_cur) {
+                    antiprompt_cur++;
+                }
+                else {
+                    antiprompt_cur = antiprompt;
+                }
+                vocab_cur++;
+            }
+        }
     }
 
     // report achieved tok/s
-    long end = time_in_ms();
-    printf("\nachieved tok/s: %f\n", steps / (double)(end-start)*1000);
+    if (mode == MODE_TIME) {
+        long end = time_in_ms();
+        printf("\nachieved tok/s: %f\n", config.seq_len / (double)(end-start)*1000);
+    }
 
     // memory and file handles cleanup
     free_run_state(&state);
